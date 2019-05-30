@@ -24,7 +24,7 @@ bool handle_fun2(std::string url, std::string body, mg_connection *c, OnRspCallb
     std::cout << "url: " << url << std::endl;
     std::cout << "body: " << body << std::endl;
 
-    rsp_callback(c, "rsp2");
+    rsp_callback(c, "welcome to fun2");
 
     return true;
 }

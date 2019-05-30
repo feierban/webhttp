@@ -16,8 +16,10 @@ DEFINES += QT_DEPRECATED_WARNINGS
 
 SOURCES += main.cpp \
     ../common/mongoose.c \
-    http_server.cpp
+    http_server.cpp \
+    fanhttpserver.cpp
 
 HEADERS += \
     ../common/mongoose.h \
-    http_server.h
+    http_server.h \
+    fanhttpserver.h
