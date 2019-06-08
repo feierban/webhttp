@@ -1,10 +1,38 @@
 #include <utility>
+#include "QDebug"
 #include "fanhttpserver.h"
 
-FanHttpServer::FanHttpServer(const QString addr) :m_addr(addr)
+FanHttpServerHelper FanHttpServer::m_serverHelper;
+std::unordered_set<mg_connection *> FanHttpServer::m_websocketSessionSet;
+FanHttpServerHelper::FanHttpServerHelper(QObject *parent)
 {
-    m_serverOption.enable_directory_listing = "yes";
-    m_serverOption.document_root = s_web_dir.c_str();
+}
+
+FanHttpServerHelper::~FanHttpServerHelper()
+{
+}
+
+void FanHttpServerHelper::emitHandleHttpEvent(mg_connection *connection, http_message *http_req)
+{
+    emit sigHandleHttpEvent(connection, http_req);
+}
+
+void FanHttpServerHelper::emitHandleWebsocketMessage(mg_connection *connection, int event_type, websocket_message *ws_msg)
+{
+    emit sigHandleWebsocketMessage(connection, event_type, ws_msg);
+}
+
+FanHttpServer::FanHttpServer(const QString addr)
+    :m_addr(addr)
+{
+    m_webDir = QString();
+    connect(&m_serverHelper, &FanHttpServerHelper::sigHandleHttpEvent,
+            this, &FanHttpServer::HandleHttpEvent);
+    connect(&m_serverHelper, &FanHttpServerHelper::sigHandleWebsocketMessage,
+            this, &FanHttpServer::HandleWebsocketMessage);
+
+    m_serverOption.enable_directory_listing = "no";
+    m_serverOption.document_root = m_webDir.toLatin1().data();
 
     // 其他http设置
 
@@ -15,44 +43,70 @@ FanHttpServer::FanHttpServer(const QString addr) :m_addr(addr)
 void FanHttpServer::start()
 {
     mg_mgr_init(&m_mgr, NULL);
-    mg_connection *connection = mg_bind(&m_mgr, m_addr.data(), HttpServer::OnHttpWebsocketEvent);
+    mg_connection *connection = mg_bind(&m_mgr, m_addr.toLatin1().data(), &FanHttpServer::OnHttpWebsocketEvent);
     if (connection == NULL)
-        return false;
+        return;
     // for both http and websocket
     mg_set_protocol_http_websocket(connection);
 
-    printf("starting http server at port: %s\n", m_port.c_str());
+    qDebug() << "starting http server at port: " << m_addr;
+
     // loop
     while (true)
         mg_mgr_poll(&m_mgr, 500); // ms
 
-    return true;
+    return;
+}
+
+void FanHttpServer::sendHttpRsp(mg_connection *connection, std::string rsp)
+{
+    // --- 未开启CORS
+    // 必须先发送header, 暂时还不能用HTTP/2.0
+    mg_printf(connection, "%s", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
+    // 以json形式返回
+    mg_printf_http_chunk(connection, "{ \"result\": %s }", rsp.c_str());
+    // 发送空白字符快，结束当前响应
+    mg_send_http_chunk(connection, "", 0);
+
+    // --- 开启CORS
+    /*mg_printf(connection, "HTTP/1.1 200 OK\r\n"
+              "Content-Type: text/plain\n"
+              "Cache-Control: no-cache\n"
+              "Content-Length: %d\n"
+              "Access-Control-Allow-Origin: *\n\n"
+              "%s\n", rsp.length(), rsp.c_str()); */
+}
+
+void FanHttpServer::sendWebsocketMsg(mg_connection *connection, std::string msg)
+{
+    mg_send_websocket_frame(connection, WEBSOCKET_OP_TEXT, msg.c_str(), strlen(msg.c_str()));
+}
+
+bool FanHttpServer::isWebsocket(const mg_connection *connection)
+{
+    return connection->flags & MG_F_IS_WEBSOCKET;
 }
 
 void FanHttpServer::HandleHttpEvent(mg_connection *connection, http_message *http_req)
 {
-    std::string req_str = std::string(http_req->message.p, http_req->message.len);
-    printf("got request: %s\n", req_str.c_str());
+    QString req_str = QString(http_req->message.p).mid(http_req->message.len);
+    qDebug() << "got request: " << req_str;
 
     // 先过滤是否已注册的函数回调
-    std::string url = std::string(http_req->uri.p, http_req->uri.len);
-    std::string body = std::string(http_req->body.p, http_req->body.len);
-    auto it = s_handler_map.find(url);
-    if (it != s_handler_map.end())
-    {
-        ReqHandler handle_func = it->second;
-        handle_func(url, body, connection, &HttpServer::SendHttpRsp);
-    }
+    QString url = QString(http_req->uri.p).mid(http_req->uri.len);
+    QString body = QString(http_req->body.p).mid(http_req->body.len);
+
+    emit sigHandleHttpEvent(url, body, connection);
 
     // 其他请求
-    if (route_check(http_req, "/")) // index page
-        mg_serve_http(connection, http_req, s_server_option);
-    else if (route_check(http_req, "/api/hello"))
+    if (routeCheck(http_req, "/")) // index page
+        mg_serve_http(connection, http_req, m_serverOption);
+    else if (routeCheck(http_req, "/api/hello"))
     {
         // 直接回传
-        SendHttpRsp(connection, "welcome to httpserver");
+        sendHttpRsp(connection, "welcome to httpserver");
     }
-    else if (route_check(http_req, "/api/sum"))
+    else if (routeCheck(http_req, "/api/sum"))
     {
         // 简单post请求，加法运算测试
         char n1[100], n2[100];
@@ -64,7 +118,7 @@ void FanHttpServer::HandleHttpEvent(mg_connection *connection, http_message *htt
 
         /* Compute the result and send it back as a JSON object */
         result = strtod(n1, NULL) + strtod(n2, NULL);
-        SendHttpRsp(connection, std::to_string(result));
+        sendHttpRsp(connection, std::to_string(result));
     }
     else
     {
@@ -86,9 +140,9 @@ void FanHttpServer::HandleWebsocketMessage(mg_connection *connection, int event_
         printf("client addr: %s\n", addr);
 
         // 添加 session
-        s_websocket_session_set.insert(connection);
+        m_websocketSessionSet.insert(connection);
 
-        SendWebsocketMsg(connection, "client websocket connected");
+        sendWebsocketMsg(connection, "client websocket connected");
     } else if (event_type == MG_EV_WEBSOCKET_FRAME) {
         mg_str received_msg = {
             (char *)ws_msg->data, ws_msg->size
@@ -99,16 +153,30 @@ void FanHttpServer::HandleWebsocketMessage(mg_connection *connection, int event_
 
         // do sth to process request
         printf("received msg: %s\n", buff);
-        SendWebsocketMsg(connection, "send your msg back: " + std::string(buff));
+        sendWebsocketMsg(connection, "send your msg back: " + std::string(buff));
         //BroadcastWebsocketMsg("broadcast msg: " + std::string(buff));
     } else if (event_type == MG_EV_CLOSE) {
         if (isWebsocket(connection)) {
             printf("client websocket closed\n");
             // 移除session
-            if (s_websocket_session_set.find(connection) != s_websocket_session_set.end())
-                s_websocket_session_set.erase(connection);
+            if (m_websocketSessionSet.find(connection) != m_websocketSessionSet.end())
+                m_websocketSessionSet.erase(connection);
         }
     }
+}
+
+bool FanHttpServer::routeCheck(http_message *http_msg, char *route_prefix)
+{
+    if (mg_vcmp(&http_msg->uri, route_prefix) == 0)
+        return true;
+
+    return false;
+
+    // TODO: 还可以判断 GET, POST, PUT, DELTE等方法
+    //mg_vcmp(&http_msg->method, "GET");
+    //mg_vcmp(&http_msg->method, "POST");
+    //mg_vcmp(&http_msg->method, "PUT");
+    //mg_vcmp(&http_msg->method, "DELETE");
 }
 
 void FanHttpServer::OnHttpWebsocketEvent(mg_connection *connection, int event_type, void *event_data)
@@ -117,13 +185,14 @@ void FanHttpServer::OnHttpWebsocketEvent(mg_connection *connection, int event_ty
     if (event_type == MG_EV_HTTP_REQUEST)
     {
         http_message *http_req = (http_message *)event_data;
-        HandleHttpEvent(connection, http_req);
+        m_serverHelper.emitHandleHttpEvent(connection, http_req);
     }
     else if (event_type == MG_EV_WEBSOCKET_HANDSHAKE_DONE ||
              event_type == MG_EV_WEBSOCKET_FRAME ||
              event_type == MG_EV_CLOSE)
     {
         websocket_message *ws_message = (struct websocket_message *)event_data;
-        HandleWebsocketMessage(connection, event_type, ws_message);
+        m_serverHelper.emitHandleWebsocketMessage(connection, event_type, ws_message);
     }
 }
+
